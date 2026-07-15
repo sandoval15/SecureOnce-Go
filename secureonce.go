@@ -32,7 +32,7 @@ func (o *SecureOnce) Do(f func(*error), s func()(bool)) (err error) {
 func (o *SecureOnce) reset() {
 	defer o.checkReset.Store(false)
 	if f := o.escapeFunc.Load(); f != nil {
-		if fn := *f; fn() { o.done.Store(false) }
+		if fn := *f; fn() { o.escapeFunc.Store(nil); o.done.Store(false) }
 	}
 }
 

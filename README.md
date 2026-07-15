@@ -1,118 +1,122 @@
+🇺🇸 English | 🇪🇸 [Español](README.es.md)
+
 # SecureOnce
 
-`SecureOnce` es una adaptación de `sync.Once` de la librería estándar de Go, pensada para los casos en los que necesitás ejecutar algo **una sola vez**, como con el `Once` original, pero donde ese "una sola vez" **no es del todo definitivo**: si las condiciones que permitieron cerrar el `Once` dejan de cumplirse, `SecureOnce` puede reabrirse solo, sin que tengas que gestionar ese estado a mano.
+`SecureOnce` is an adaptation of Go's standard library `sync.Once`, designed for cases where you need to run something **exactly once** — like the original `Once` — but where that "once" **isn't entirely final**: if the conditions that allowed the `Once` to close stop being true, `SecureOnce` can reopen itself automatically, without you having to manage that state by hand.
 
-Mantiene (casi) la misma velocidad del `sync.Once` nativo en el fast path, a cambio de un poco más de memoria y cómputo en segundo plano.
+It keeps (almost) the same speed as native `sync.Once` on the fast path, in exchange for a bit more memory and background computation.
 
-## Motivación
+## Motivation
 
-`sync.Once` es rapidísimo, pero es **ciego**: una vez que `Do` se ejecuta con éxito, queda cerrado para siempre, sin importar si la condición que lo justificaba sigue siendo válida.
+`sync.Once` is extremely fast, but it's **blind**: once `Do` runs successfully, it stays closed forever, regardless of whether the condition that justified it is still valid.
 
-`SecureOnce` agrega una capa de seguridad para esos casos, con dos ideas centrales:
+`SecureOnce` adds a safety layer for those cases, built around two core ideas:
 
-1. **Reintento en caso de error**: si la función a ejecutar falla, el `SecureOnce` no se cierra. La próxima llamada lo vuelve a intentar (a diferencia de `sync.Once`, que se considera "gastado" incluso si el usuario maneja el error manualmente adentro).
-2. **Revalidación asíncrona**: una vez cerrado, en la *siguiente* llamada se dispara una goroutine en segundo plano que evalúa una función de escape (`s func() bool`). Si esa función determina que ya no se dan las condiciones para seguir cerrado, `SecureOnce` se reabre, y una futura llamada volverá a ejecutar la función original.
+1. **Retry on error**: if the function fails, `SecureOnce` doesn't close. The next call retries it (unlike `sync.Once`, which is considered "spent" even if the caller handles the error manually inside).
+2. **Asynchronous revalidation**: once closed, the *next* call triggers a background goroutine that evaluates an escape function (`s func() bool`). If that function determines the conditions for staying closed no longer hold, `SecureOnce` reopens, and a future call to `Do` will run the original function again.
 
-### ¿Por qué revalidar en la llamada siguiente y no en la misma?
+### Why revalidate on the next call instead of the same one?
 
-Se podría pensar que sería mejor detectar el error y solucionarlo en la misma llamada. El problema es que eso rompería la velocidad nativa que es justamente la razón de ser de `Once`: agregar lógica de revalidación en el propio hilo de ejecución te obliga a bloquear o esperar un resultado antes de devolver el control.
+You might think it'd be better to detect and fix the error within the same call. The problem is that this would break the native speed that is the whole point of `Once`: adding revalidation logic to the execution thread itself forces you to block or wait for a result before returning control.
 
-Con este enfoque, la llamada que detecta la necesidad de revalidar **devuelve el control inmediatamente** (igual que un `Once` normal) y la revalidación ocurre en paralelo, en una goroutine. El costo real es:
+With this approach, the call that detects the need to revalidate **returns control immediately** (just like a normal `Once`), and revalidation happens in parallel, in a goroutine. The real cost is:
 
-- Más memoria/cómputo por la goroutine y por los campos atómicos extra.
-- Una comprobación atómica adicional en el fast path (el `CompareAndSwap` de `checkReset`).
+- More memory/computation from the goroutine and the extra atomic fields.
+- One extra atomic check on the fast path (the `CompareAndSwap` in `checkReset`).
 
-A cambio, se gana la capacidad de autocorregirse sin intervención manual, manteniendo el fast path prácticamente al nivel de `sync.Once`.
+In exchange, you gain the ability to self-correct without manual intervention, while keeping the fast path practically at `sync.Once` level.
 
-## Instalación
+## Installation
 
-```bash
-go get <ruta-del-modulo>/secureonce
+``` bash
+go get <module-path>/secureonce
 ```
 
 ## API
 
-```go
+``` go
 func (o *SecureOnce) Do(f func(*error), s func() bool) error
 ```
 
-- **`f func(*error)`**: la función que se ejecuta una única vez (mientras el `Once` esté "abierto"). Debe reportar el resultado escribiendo en el puntero a error que recibe. Si escribe `nil`, `SecureOnce` se considera cerrado. Si escribe un error, se mantiene abierto y la próxima llamada lo vuelve a intentar.
-- **`s func() bool`**: la función de escape (opcional, puede ser `nil`). Se evalúa en segundo plano, después de que el `Once` ya está cerrado, para decidir si corresponde reabrirlo. Si devuelve `true`, se reabre.
+- **`f func(*error)`**: the function that runs exactly once (while the `Once` is "open"). It must report its result by writing to the error pointer it receives. If it writes `nil`, `SecureOnce` is considered closed. If it writes an error, it stays open and the next call retries it.
+- **`s func() bool`**: the escape function (optional, can be `nil`). It's evaluated in the background, after the `Once` is already closed, to decide whether it should reopen. If it returns `true`, it reopens.
 
-El valor cero de `SecureOnce` ya está listo para usarse, igual que `sync.Once`. No necesita constructor.
+The zero value of `SecureOnce` is ready to use, just like `sync.Once`. No constructor needed.
 
-### Comportamiento paso a paso
+### Step-by-step behavior
 
-1. **Mientras está abierto** (`done == false`):
-   - Se toma el `Mutex` interno.
-   - Si todavía sigue abierto (doble chequeo dentro del lock), se guarda la función de escape `s` (solo la primera vez que se recibe una no nula; llamadas posteriores no la sobrescriben) y se ejecuta `f`.
-   - Si `f` reporta `nil`, se marca como cerrado.
-   - Si `f` reporta un error, ese error se devuelve, pero el `Once` sigue abierto para el próximo intento.
+1. **While open** (`done == false`):
 
-2. **Una vez cerrado** (`done == true`):
-   - Las llamadas siguientes toman el fast path: una simple lectura atómica y `return nil`, sin tocar el mutex ni volver a ejecutar `f`.
-   - En ese mismo paso, si no hay ya una revalidación en curso, se dispara (una sola vez por ciclo, gracias al `CompareAndSwap` sobre `checkReset`) una goroutine que ejecuta la función de escape guardada.
-   - Si la función de escape devuelve `true`, el `Once` se reabre (`done` vuelve a `false`) y una futura llamada a `Do` volverá a ejecutar `f` desde cero.
+   - The internal `Mutex` is acquired.
+   - If it's still open (double-check inside the lock), the escape function `s` is stored (only the first time a non-nil one is received; later calls don't overwrite it) and `f` is executed.
+   - If `f` reports `nil`, it's marked as closed.
+   - If `f` reports an error, that error is returned, but the `Once` stays open for the next attempt.
 
-### Garantías de concurrencia
+2. **Once closed** (`done == true`):
 
-- `SecureOnce` no se debe copiar después de usarse (igual que `sync.Once`); incluye un campo `noCopy` para que `go vet` lo detecte.
-- La función de escape se guarda con `atomic.Pointer`, evitando data races entre quien la registra y la goroutine que la lee.
-- Solo una goroutine de revalidación puede estar en vuelo a la vez, gestionada mediante `checkReset` (un `atomic.Bool` con `CompareAndSwap`).
+   - Subsequent calls take the fast path: a simple atomic read and `return nil`, without touching the mutex or running `f` again.
+   - At that same step, if there isn't already a revalidation in progress, a goroutine is triggered (only once per cycle, thanks to the `CompareAndSwap` on `checkReset`) that runs the stored escape function.
+   - If the escape function returns `true`, the `Once` reopens (`done` goes back to `false`) and a future call to `Do` will run `f` from scratch.
 
-## Ejemplo de uso
+### Concurrency guarantees
 
-```go
+- `SecureOnce` must not be copied after first use (just like `sync.Once`); it includes a `noCopy` field so `go vet` can catch this.
+- The escape function is stored using `atomic.Pointer`, avoiding data races between whoever registers it and the goroutine that reads it.
+- Only one revalidation goroutine can be in flight at a time, managed via `checkReset` (an `atomic.Bool` with `CompareAndSwap`).
+
+## Usage example
+
+``` go
 var once secureonce.SecureOnce
 
-func cargarConfiguracion() error {
+func loadConfig() error {
     return once.Do(
         func(err *error) {
-            cfg, e := leerConfigDesdeDisco()
+            cfg, e := readConfigFromDisk()
             if e != nil {
                 *err = e
                 return
             }
-            configGlobal = cfg
+            globalConfig = cfg
         },
         func() bool {
-            // Lógica de escape: solo booleana, liviana.
-            return configuracionDesactualizada()
+            // Escape logic: boolean only, lightweight.
+            return configIsOutdated()
         },
     )
 }
 ```
 
-- Mientras `leerConfigDesdeDisco` falle, cada llamada a `cargarConfiguracion` reintentará cargar la config.
-- Una vez cargada con éxito, las llamadas siguientes son prácticamente gratis.
-- Si en algún momento `configuracionDesactualizada` devuelve `true`, la próxima llamada a `Do` (después de la revalidación en segundo plano) volverá a ejecutar `leerConfigDesdeDisco`.
+- As long as `readConfigFromDisk` fails, every call to `loadConfig` will retry loading the config.
+- Once loaded successfully, subsequent calls are practically free.
+- If at some point `configIsOutdated` returns `true`, the next call to `Do` (after the background revalidation) will run `readConfigFromDisk` again.
 
-## ⚠️ Importante: sobre la función de escape (`s`)
+## ⚠️ Important: about the escape function (`s`)
 
-La función de escape se ejecuta en una goroutine dedicada, fuera del `Mutex` principal, cada vez que se detecta que corresponde revalidar. Por eso es crítico que:
+The escape function runs in a dedicated goroutine, outside the main `Mutex`, every time a revalidation is triggered. Because of that, it's critical that it:
 
-- **Contenga únicamente lógica booleana**: una comparación, una lectura de un flag, un chequeo de expiración, etc.
-- **No contenga lógica de negocio pesada, llamadas bloqueantes o I/O costoso.**
+- **Contains only boolean logic**: a comparison, a flag read, an expiration check, etc.
+- **Does not contain heavy business logic, blocking calls, or expensive I/O.**
 
-Si la función de escape es muy lenta o costosa:
+If the escape function is too slow or expensive:
 
-- La goroutine de revalidación demorará más de lo necesario, retrasando el momento en que el `Once` realmente se reabre.
-- Puedes introducir **desincronizaciones impredecibles** entre el estado real de tu sistema y el estado que `SecureOnce` cree tener, ya que mientras la goroutine sigue evaluando, todas las llamadas concurrentes siguen tomando el fast path como si nada hubiera cambiado.
+- The revalidation goroutine will take longer than necessary, delaying the moment the `Once` actually reopens.
+- You can introduce **unpredictable desynchronization** between your system's real state and the state `SecureOnce` believes it has, since while the goroutine keeps evaluating, all concurrent calls keep taking the fast path as if nothing had changed.
 
-En resumen: la función de escape es una señal, no un lugar para trabajar.
+In short: the escape function is a signal, not a place to do work.
 
 ## Trade-offs
 
-| | `sync.Once` | `SecureOnce` |
-| --- | --- | --- |
-| Fast path | 1 lectura atómica | 1 lectura atómica + 1 `CompareAndSwap` |
-| Reintento tras error | No (queda "gastado") | Sí, en la próxima llamada |
-| Autorrecuperación / reapertura | No | Sí, vía función de escape asíncrona |
-| Memoria extra | — | `atomic.Bool` extra + `atomic.Pointer` para la función de escape |
-| Cómputo extra | — | Goroutine ocasional de revalidación |
+|                              | `sync.Once`         | `SecureOnce`                                                  |
+| ---------------------------- | -------------------- | -------------------------------------------------------------- |
+| Fast path                    | 1 atomic read        | 1 atomic read + 1 `CompareAndSwap`                              |
+| Retry after error            | No (stays "spent")   | Yes, on the next call                                           |
+| Self-recovery / reopening    | No                   | Yes, via async escape function                                  |
+| Extra memory                 | —                     | Extra `atomic.Bool` + `atomic.Pointer` for the escape function  |
+| Extra computation             | —                     | Occasional revalidation goroutine                                |
 
-`SecureOnce` cambia algo de memoria y cómputo en segundo plano por seguridad y autorrecuperación, sin resignar en gran medida la velocidad del fast path que hace atractivo a `Once` en primer lugar.
+`SecureOnce` trades a bit of memory and background computation for safety and self-recovery, without giving up much of the fast-path speed that makes `Once` attractive in the first place.
 
-## Licencia
+## License
 
-_Anzhi_"# SecureOnce-Go" 
+*Anzhi*
