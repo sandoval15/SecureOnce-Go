@@ -14,6 +14,7 @@ Mantiene (casi) la misma velocidad del `sync.Once` nativo en el fast path, a cam
 
 1. **Reintento en caso de error**: si la función a ejecutar falla, el `SecureOnce` no se cierra. La próxima llamada lo vuelve a intentar (a diferencia de `sync.Once`, que se considera "gastado" incluso si el usuario maneja el error manualmente adentro).
 2. **Revalidación asíncrona**: una vez cerrado, en la *siguiente* llamada se dispara una goroutine en segundo plano que evalúa una función de escape (`s func() bool`). Si esa función determina que ya no se dan las condiciones para seguir cerrado, `SecureOnce` se reabre, y una futura llamada volverá a ejecutar la función original.
+3. **Coalescing de llamadas concurrentes (single-flight)**: mientras está abierto, si varias goroutines llaman a `Do` al mismo tiempo, solo una de ellas (el "líder") ejecuta realmente `f`. El resto ("seguidoras") no llama a `f` por su cuenta — esperan y reciben el mismo resultado que obtuvo el líder. Esto evita ejecuciones redundantes de `f` cuando varios llamadores coinciden mientras un intento anterior todavía no terminó (o sigue fallando).
 
 ### ¿Por qué revalidar en la llamada siguiente y no en la misma?
 
@@ -47,10 +48,13 @@ El valor cero de `SecureOnce` ya está listo para usarse, igual que `sync.Once`.
 
 1. **Mientras está abierto** (`done == false`):
 
-   - Se toma el `Mutex` interno.
-   - Si todavía sigue abierto (doble chequeo dentro del lock), se guarda la función de escape `s` (solo la primera vez que se recibe una no nula; llamadas posteriores no la sobrescriben) y se ejecuta `f`.
-   - Si `f` reporta `nil`, se marca como cerrado.
-   - Si `f` reporta un error, ese error se devuelve, pero el `Once` sigue abierto para el próximo intento.
+   - Se toma el `Mutex` interno brevemente para decidir el rol del llamador:
+     - Si nadie más está ejecutando `f` en este momento (el CAS de `thereIsLeader` de `false` a `true` tiene éxito), el llamador se convierte en **líder**: libera el lock y ejecuta `f` por su cuenta, fuera del mutex.
+     - Si ya hay un líder, el llamador se convierte en **seguidor**: registra un canal con buffer en `channels`, libera el lock, y se bloquea esperando en ese canal el resultado del líder — nunca ejecuta `f` por sí mismo.
+   - La ejecución de `f` por parte del líder está envuelta en un `recover()`. Si `f` hace panic, ese panic se convierte en el `error` devuelto (se conserva tal cual si ya era un `error`, o se envuelve en uno si no lo era).
+   - Si `f` reporta `nil` (y no hizo panic), se marca como cerrado y, en ese mismo éxito, se guarda la función de escape `s` (solo la primera vez que se recibe una no nula; llamadas posteriores no la sobrescriben).
+   - Si `f` reporta un error (o hizo panic), ese error se devuelve, pero el `Once` sigue abierto para el próximo intento.
+   - En todos los casos (éxito, error o panic) el líder vuelve a tomar el mutex, transmite su resultado a cada canal de las seguidoras en espera, vacía `channels`, y libera el rol de líder (`thereIsLeader = false`) para que una futura llamada pueda convertirse en el nuevo líder.
 
 2. **Una vez cerrado** (`done == true`):
 
@@ -63,6 +67,9 @@ El valor cero de `SecureOnce` ya está listo para usarse, igual que `sync.Once`.
 - `SecureOnce` no se debe copiar después de usarse (igual que `sync.Once`); incluye un campo `noCopy` para que `go vet` lo detecte.
 - La función de escape se guarda con `atomic.Pointer`, evitando data races entre quien la registra y la goroutine que la lee.
 - Solo una goroutine de revalidación puede estar en vuelo a la vez, gestionada mediante `checkReset` (un `atomic.Bool` con `CompareAndSwap`).
+- Solo una goroutine puede ser líder a la vez, gestionado mediante `thereIsLeader` (un `atomic.Bool` con `CompareAndSwap`). El acceso al slice `channels` (seguidoras registrándose, líder transmitiendo el resultado) siempre ocurre bajo el `Mutex`, así que no hay data race ahí aunque el líder ejecute `f` fuera del lock.
+- Un panic dentro de `f` es recuperado por el líder y convertido en el `error` devuelto; no tumba al llamador, y `SecureOnce` se mantiene abierto para que la próxima llamada reintente.
+- Un panic dentro de la función de escape `s` también se recupera, pero **no** se convierte en error — solo se imprime por stdout y se descarta. `SecureOnce` se mantiene cerrado en ese caso. Conviene que `s` sea libre de panics si dependés de ella para disparar la reapertura.
 
 ## Ejemplo de uso
 
@@ -107,13 +114,16 @@ En resumen: la función de escape es una señal, no un lugar para trabajar.
 
 ## Trade-offs
 
-|                                 | `sync.Once`           | `SecureOnce`                                                       |
-| -------------------------------- | ----------------------- | -------------------------------------------------------------------- |
-| Fast path                        | 1 lectura atómica       | 1 lectura atómica + 1 `CompareAndSwap`                                |
-| Reintento tras error              | No (queda "gastado")    | Sí, en la próxima llamada                                             |
-| Autorrecuperación / reapertura    | No                       | Sí, vía función de escape asíncrona                                   |
-| Memoria extra                     | —                        | `atomic.Bool` extra + `atomic.Pointer` para la función de escape       |
-| Cómputo extra                     | —                        | Goroutine ocasional de revalidación                                    |
+|                                       | `sync.Once`             | `SecureOnce`                                                                        |
+| -------------------------------------- | ------------------------- | -------------------------------------------------------------------------------------- |
+| Fast path                              | 1 lectura atómica          | 1 lectura atómica + 1 `CompareAndSwap`                                                  |
+| Reintento tras error                    | No (queda "gastado")       | Sí, en la próxima llamada                                                               |
+| Autorrecuperación / reapertura          | No                         | Sí, vía función de escape asíncrona                                                     |
+| Llamadas concurrentes mientras está abierto | Cada una espera el lock interno, solo la primera ejecuta `f` | Coalescidas vía líder/seguidoras: solo el líder ejecuta `f`, las seguidoras reutilizan su resultado |
+| Panic dentro de `f`                     | Se propaga al llamador     | Se recupera y se devuelve como `error`; `SecureOnce` sigue abierto para reintentar       |
+| Panic dentro de la función de escape `s` | N/A                        | Se recupera y se loguea por stdout, no se expone como error                             |
+| Memoria extra                           | —                          | `atomic.Bool`s extra, `atomic.Pointer` para la función de escape, y un slice de canales de seguidoras |
+| Cómputo extra                           | —                          | Goroutine ocasional de revalidación                                                     |
 
 `SecureOnce` cambia algo de memoria y cómputo en segundo plano por seguridad y autorrecuperación, sin resignar en gran medida la velocidad del fast path que hace atractivo a `Once` en primer lugar.
 
